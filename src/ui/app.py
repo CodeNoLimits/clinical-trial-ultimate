@@ -18,6 +18,7 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 import time
 import hashlib
+import requests
 
 import streamlit as st
 import pandas as pd
@@ -149,6 +150,105 @@ def get_api_key() -> str:
         os.environ["GOOGLE_API_KEY"] = st.session_state.google_api_key
         return st.session_state.google_api_key
     return None
+
+
+# =============================================================================
+# CLINICALTRIALS.GOV API INTEGRATION
+# =============================================================================
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_trial_from_clinicaltrials_gov(nct_id: str) -> Dict[str, Any]:
+    """
+    Fetch trial data from ClinicalTrials.gov API.
+    API Documentation: https://clinicaltrials.gov/data-api/api
+    """
+    if not nct_id or not nct_id.strip():
+        return None
+
+    # Clean and validate NCT ID format
+    nct_id = nct_id.strip().upper()
+    if not nct_id.startswith("NCT"):
+        return None
+
+    try:
+        # ClinicalTrials.gov API v2
+        url = f"https://clinicaltrials.gov/api/v2/studies/{nct_id}"
+        headers = {"Accept": "application/json"}
+
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            # Extract relevant protocol information
+            protocol_section = data.get("protocolSection", {})
+            identification = protocol_section.get("identificationModule", {})
+            eligibility = protocol_section.get("eligibilityModule", {})
+            description = protocol_section.get("descriptionModule", {})
+            conditions = protocol_section.get("conditionsModule", {})
+
+            # Build protocol text
+            title = identification.get("officialTitle") or identification.get("briefTitle", "")
+            brief_summary = description.get("briefSummary", "")
+            detailed_desc = description.get("detailedDescription", "")
+
+            # Eligibility criteria
+            eligibility_text = eligibility.get("eligibilityCriteria", "")
+            min_age = eligibility.get("minimumAge", "N/A")
+            max_age = eligibility.get("maximumAge", "N/A")
+            sex = eligibility.get("sex", "All")
+            healthy_volunteers = eligibility.get("healthyVolunteers", "No")
+
+            # Conditions
+            conditions_list = conditions.get("conditions", [])
+            keywords = conditions.get("keywords", [])
+
+            # Format the protocol
+            protocol_text = f"""
+CLINICAL TRIAL: {nct_id}
+TITLE: {title}
+
+BRIEF SUMMARY:
+{brief_summary}
+
+CONDITIONS: {', '.join(conditions_list) if conditions_list else 'Not specified'}
+KEYWORDS: {', '.join(keywords) if keywords else 'Not specified'}
+
+AGE REQUIREMENTS: {min_age} to {max_age}
+SEX: {sex}
+HEALTHY VOLUNTEERS: {healthy_volunteers}
+
+ELIGIBILITY CRITERIA:
+{eligibility_text}
+
+DETAILED DESCRIPTION:
+{detailed_desc if detailed_desc else 'Not provided'}
+"""
+
+            return {
+                "nct_id": nct_id,
+                "title": title,
+                "protocol_text": protocol_text.strip(),
+                "conditions": conditions_list,
+                "eligibility_criteria": eligibility_text,
+                "min_age": min_age,
+                "max_age": max_age,
+                "sex": sex,
+                "brief_summary": brief_summary,
+                "status": data.get("protocolSection", {}).get("statusModule", {}).get("overallStatus", "Unknown"),
+                "raw_data": data
+            }
+        elif response.status_code == 404:
+            return {"error": f"Trial {nct_id} not found on ClinicalTrials.gov"}
+        else:
+            return {"error": f"API error: {response.status_code}"}
+
+    except requests.exceptions.Timeout:
+        return {"error": "Request timeout - ClinicalTrials.gov API slow"}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Network error: {str(e)}"}
+    except Exception as e:
+        return {"error": f"Error fetching trial: {str(e)}"}
 
 
 # =============================================================================
@@ -388,10 +488,59 @@ if trial_history:
             st.session_state.selected_trial_id = trial_id_hist
             st.rerun()
 
-# Trial input
+# Trial input with auto-fetch from ClinicalTrials.gov
 default_trial = st.session_state.get("selected_trial_id", "")
 trial_id = st.sidebar.text_input("Trial ID", value=default_trial, placeholder="NCT12345678")
-trial_protocol = st.sidebar.text_area("Protocol (optional)", height=100, placeholder="Paste protocol or leave empty for default")
+
+# Initialize fetched protocol in session state
+if "fetched_protocol" not in st.session_state:
+    st.session_state.fetched_protocol = ""
+if "fetched_trial_info" not in st.session_state:
+    st.session_state.fetched_trial_info = None
+
+# Auto-fetch button
+col1, col2 = st.sidebar.columns([2, 1])
+with col1:
+    fetch_btn = st.button("Fetch from ClinicalTrials.gov", key="fetch_trial", use_container_width=True)
+with col2:
+    clear_fetch = st.button("Clear", key="clear_fetch")
+
+if clear_fetch:
+    st.session_state.fetched_protocol = ""
+    st.session_state.fetched_trial_info = None
+    st.rerun()
+
+if fetch_btn and trial_id:
+    with st.sidebar:
+        with st.spinner(f"Fetching {trial_id}..."):
+            trial_data = fetch_trial_from_clinicaltrials_gov(trial_id)
+
+            if trial_data and "error" not in trial_data:
+                st.session_state.fetched_protocol = trial_data.get("protocol_text", "")
+                st.session_state.fetched_trial_info = trial_data
+                st.success(f"Fetched: {trial_data.get('title', '')[:50]}...")
+            elif trial_data and "error" in trial_data:
+                st.error(trial_data["error"])
+            else:
+                st.error(f"Could not fetch {trial_id}")
+
+# Show fetched trial info
+if st.session_state.fetched_trial_info:
+    info = st.session_state.fetched_trial_info
+    with st.sidebar.expander("Trial Info", expanded=False):
+        st.markdown(f"**Status:** {info.get('status', 'N/A')}")
+        st.markdown(f"**Conditions:** {', '.join(info.get('conditions', []))[:100]}")
+        st.markdown(f"**Age:** {info.get('min_age', 'N/A')} - {info.get('max_age', 'N/A')}")
+        st.markdown(f"**Sex:** {info.get('sex', 'All')}")
+
+# Protocol text area (pre-filled if fetched)
+default_protocol = st.session_state.get("fetched_protocol", "")
+trial_protocol = st.sidebar.text_area(
+    "Protocol",
+    value=default_protocol,
+    height=150,
+    placeholder="Enter Trial ID above and click 'Fetch' to auto-fill, or paste protocol manually"
+)
 
 
 # =============================================================================
