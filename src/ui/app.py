@@ -335,14 +335,31 @@ def clear_session():
 
 def validate_patient_data(data: dict) -> tuple:
     """Validate patient data structure (backend validation)."""
+    # Normalize gender/sex field - accept both column names
+    if "gender" in data and "sex" not in data:
+        data["sex"] = data["gender"]
+
     required_fields = ["patient_id", "age", "sex"]
     for field in required_fields:
         if field not in data:
             return False, f"Missing required field: {field}"
     if not isinstance(data.get("age"), (int, float)) or data["age"] < 0:
         return False, "Invalid age value"
-    if data.get("sex") not in ["male", "female", "other"]:
-        return False, "Invalid sex value"
+    # Accept various sex/gender values and normalize
+    sex_value = str(data.get("sex", "")).lower().strip()
+    valid_male = ["male", "m", "homme", "masculin", "man"]
+    valid_female = ["female", "f", "femme", "féminin", "woman"]
+    valid_other = ["other", "autre", "non-binary", "unknown", ""]
+
+    if sex_value in valid_male:
+        data["sex"] = "male"
+    elif sex_value in valid_female:
+        data["sex"] = "female"
+    elif sex_value in valid_other:
+        data["sex"] = "other"
+    else:
+        data["sex"] = "other"  # Default to other for unknown values
+
     return True, "Valid"
 
 
@@ -638,7 +655,7 @@ with tab2:
                 if patients_file.name.endswith(".csv"):
                     patients_df = pd.read_csv(patients_file)
                     st.success(f"Loaded {len(patients_df)} patients from CSV")
-                    st.dataframe(patients_df.head(), use_container_width=True)
+                    st.dataframe(patients_df, use_container_width=True, height=300)
                     patients_list = patients_df.to_dict('records')
                 else:
                     patients_list = json.loads(patients_file.read().decode('utf-8'))
@@ -761,7 +778,9 @@ with tab2:
     if st.session_state.batch_results:
         st.subheader("Batch Results")
         df = pd.DataFrame(st.session_state.batch_results)
-        st.dataframe(df, use_container_width=True)
+        # Scrollable dataframe with dynamic height based on number of results
+        display_height = min(600, max(200, len(df) * 35 + 50))
+        st.dataframe(df, use_container_width=True, height=display_height)
 
         col1, col2, col3, col4 = st.columns(4)
         decisions = [r.get("decision") for r in st.session_state.batch_results]
